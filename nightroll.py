@@ -24,7 +24,7 @@ Selection and pacing are stubbed so the framing question is isolated:
 
   * pacing    -- a fixed slot length, optionally derived from a BPM.
   * window    -- the middle N seconds of each clip.
-  * coverage  -- spread over TIME (buckets across the night), not over
+  * coverage  -- spread over TIME (buckets across one event), not over
                  PEOPLE. Per-person coverage needs cross-clip face re-id,
                  which is real work and not what this test is about.
   * quality   -- duration and brightness only. No shake detection.
@@ -269,6 +269,42 @@ def set_windows(clips: list[Clip], *, slot_seconds: float) -> None:
         clip.window_start = usable / 2.0
 
 
+def cluster_events(clips: list[Clip], *, gap_hours: float) -> list[list[Clip]]:
+    """Split clips into events wherever capture time jumps by more than a gap.
+
+    A folder of gathered footage is rarely one night. Clustering on time
+    gaps recovers the events without needing anything smarter: people film
+    in bursts, and the quiet hours between bursts are unmistakable.
+    """
+    if not clips:
+        return []
+    ordered = sorted(clips, key=lambda c: c.shot_at)
+    gap = gap_hours * 3600.0
+
+    events: list[list[Clip]] = [[ordered[0]]]
+    for previous, clip in zip(ordered, ordered[1:]):
+        if clip.shot_at.timestamp() - previous.shot_at.timestamp() > gap:
+            events.append([clip])
+        else:
+            events[-1].append(clip)
+    return events
+
+
+def timestamps_look_collapsed(clips: list[Clip]) -> bool:
+    """True when every clip claims nearly the same capture time.
+
+    Copying or AirDropping footage rewrites mtime, and many phone exports
+    carry no ``creation_time`` tag at all. The result is a folder whose
+    clips all landed within a few seconds of each other, which silently
+    destroys both event clustering and ordering. Better to say so than to
+    produce a confidently wrong running order.
+    """
+    if len(clips) < 3:
+        return False
+    stamps = [c.shot_at.timestamp() for c in clips]
+    return (max(stamps) - min(stamps)) < 60.0
+
+
 # --------------------------------------------------------------------------
 # smart-cropping pipeline
 # --------------------------------------------------------------------------
@@ -470,6 +506,13 @@ def parse_args() -> argparse.Namespace:
                         help="Drop clips darker than this 0-255 average (default: 18).")
     parser.add_argument("--no-brightness", action="store_true",
                         help="Skip the brightness pass (faster probing).")
+    parser.add_argument("--gap-hours", type=float, default=6.0,
+                        help="A time gap this large starts a new event (default: 6).")
+    parser.add_argument("--event", type=int, default=None,
+                        help="Build from event N (1-indexed). Default: the biggest.")
+    parser.add_argument("--pool", action="store_true",
+                        help="Ignore events; treat the whole folder as one pool. "
+                             "Right for a pure framing test, wrong for a real recap.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Probe and plan only. No pipeline, no rendering.")
     parser.add_argument("--only", choices=["naive", "piped"], default=None,
@@ -533,7 +576,57 @@ def main() -> int:
         print("error: every clip was filtered out", file=sys.stderr)
         return 1
 
-    selected = select_for_edit(kept, slots=slots)
+    if timestamps_look_collapsed(kept):
+        print()
+        print("  warning: every clip reports nearly the same capture time.")
+        print("  Copying or AirDropping footage rewrites mtime, and many phone")
+        print("  exports carry no creation_time tag. Event grouping and running")
+        print("  order are meaningless here -- clips will be used in name order.")
+        print("  To fix: copy with `cp -p`, or re-export preserving metadata.")
+        events = [kept]
+        pooled = True
+    else:
+        events = cluster_events(kept, gap_hours=args.gap_hours)
+        pooled = args.pool
+
+    if pooled or len(events) == 1:
+        pool = kept if pooled else events[0]
+        if len(events) > 1:
+            print(f"\n{len(events)} events found; pooling all "
+                  f"{len(pool)} clips (--pool).")
+    else:
+        print(f"\n{len(events)} events found (gap > {args.gap_hours:g}h):")
+        for index, event in enumerate(events, start=1):
+            first = event[0].shot_at.astimezone()
+            last = event[-1].shot_at.astimezone()
+            span = (last - first).total_seconds() / 3600.0
+            print(f"  {index:>3}  {first:%a %d %b %H:%M}  "
+                  f"{len(event):>3} clips  {span:>4.1f}h")
+
+        if args.event is not None:
+            if not 1 <= args.event <= len(events):
+                print(f"error: --event {args.event} out of range "
+                      f"(1-{len(events)})", file=sys.stderr)
+                return 2
+            pool = events[args.event - 1]
+            print(f"\nusing event {args.event} ({len(pool)} clips)")
+        else:
+            pool = max(events, key=len)
+            chosen_index = events.index(pool) + 1
+            print(f"\nusing event {chosen_index}, the biggest "
+                  f"({len(pool)} clips). --event N picks another, "
+                  f"--pool uses everything.")
+
+    # The folder-wide check above catches a wholly-flattened folder. This
+    # catches the commoner case: one event's clips share a timestamp because
+    # that batch was copied, while other events kept theirs.
+    if not timestamps_look_collapsed(kept) and timestamps_look_collapsed(pool):
+        print()
+        print("  warning: the chosen clips all report the same capture time,")
+        print("  so their running order is arbitrary (falling back to name")
+        print("  order). Copying rewrites mtime -- use `cp -p` to preserve it.")
+
+    selected = select_for_edit(pool, slots=slots)
     set_windows(selected, slot_seconds=slot_seconds)
 
     print()
@@ -551,6 +644,9 @@ def main() -> int:
         "footage": str(args.footage.resolve()),
         "found": len(sources),
         "usable": len(kept),
+        "events_found": len(events),
+        "event_pool_size": len(pool),
+        "pooled": pooled,
         "slot_seconds": slot_seconds,
         "slots": len(selected),
         "selected": [

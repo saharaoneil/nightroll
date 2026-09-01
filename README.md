@@ -278,16 +278,51 @@ the defaults.
 
 1. **Probe** every clip: duration, dimensions, capture time, average brightness.
 2. **Filter** on duration and brightness. Rejections are printed with reasons.
-3. **Select** by bucketing the night into equal time windows and taking the
-   longest clip from each, so the edit spans the whole night rather than
+3. **Group** clips into events on capture-time gaps (default: a gap over 6
+   hours starts a new event), because a gathered folder is rarely one night.
+   It reports what it found and uses the biggest event by default.
+4. **Select** by bucketing that event into equal time windows and taking the
+   longest clip from each, so the edit spans the whole event rather than
    clustering wherever people filmed most.
-4. **Crop** the survivors through the pipeline, one subprocess per clip. A clip
+5. **Crop** the survivors through the pipeline, one subprocess per clip. A clip
    that fails is logged and skipped, never fatal.
-5. **Cut** a fixed-length window from the middle of each clip and concatenate to
+6. **Cut** a fixed-length window from the middle of each clip and concatenate to
    1080x1920 / 30fps, with optional music over the top.
 
 Every run writes `plan.json`: what was chosen, what was rejected and why, and
 where each artifact landed.
+
+### Footage from more than one night
+
+Fine — that is the normal case, and the tool expects it.
+
+```bash
+python nightroll.py ~/footage --dry-run          # see what events it found
+python nightroll.py ~/footage --event 3          # build from event 3
+python nightroll.py ~/footage --gap-hours 12     # coarser grouping
+python nightroll.py ~/footage --pool             # ignore events entirely
+```
+
+For the framing experiment specifically, **coherence does not matter**.
+`--pool` is the right call: the question is whether automatic framing beats a
+centre-crop on bad amateur footage, and a reel stitched from four different
+nights answers that just as well as one night would. Do not let "I need a
+proper single night" hold up the test.
+
+It matters for the *second* question — whether the output feels like a night
+worth posting — and that one is worth answering later, on real single-event
+footage, once framing has earned it.
+
+#### One thing to get right while gathering
+
+**Copy with `cp -p`, or AirDrop rather than re-export.** Plain copying rewrites
+mtime, and many phone exports carry no `creation_time` tag at all, so every
+clip lands with the same timestamp. That silently destroys both event grouping
+and running order.
+
+The tool detects this and says so — across the whole folder, and within a
+single event when only that batch was flattened — but it can only warn. It
+cannot recover a timestamp that is gone.
 
 ### What is deliberately faked
 
@@ -297,7 +332,7 @@ what this test is asking:
 - **Pacing** — a fixed slot, or `4 * 60 / bpm`. No beat detection.
 - **Window** — the middle of the clip. People record before anything happens
   and stop after it stops; the middle is a guess, not a content decision.
-- **Coverage** — spread over *time*, not over *people*. Per-person coverage
+- **Coverage** — spread over *time within one event*, not over *people*. Per-person coverage
   needs cross-clip face re-identification, which is real work and would be the
   first thing to build once framing is proven.
 - **Quality** — duration and brightness only. No shake detection.
