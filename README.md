@@ -241,3 +241,74 @@ Lives in the same copyright gray zone the whole edit scene does.
 Upload a group video; it finds the person the frame keeps leaving behind and
 makes *their* cut instead. Pure comedy, one afternoon of work, good top-of-funnel
 for any of the above.
+
+---
+
+## Prototype: `nightroll.py`
+
+Builds the edit **twice** from the same folder of clips — same selection, same
+ordering, same pacing, same music — changing only the framing:
+
+- `nightroll_naive.mp4` — centre-crop to 9:16. **The control.**
+- `nightroll_piped.mp4` — each clip through the smart-cropping pipeline. **The treatment.**
+
+Watch them back to back. That comparison is the whole experiment: if the
+difference is not obvious, the concept does not work, and you found out in a
+week instead of after building an app.
+
+### Run it
+
+```bash
+# Fast sanity check. No pipeline, no GPU -- just probes and prints the plan.
+python nightroll.py ~/footage/saturday --dry-run
+
+# The real thing.
+python nightroll.py ~/footage/saturday --out ./out --music track.m4a
+
+# Pace to a tempo instead of a fixed slot (4 beats per clip).
+python nightroll.py ~/footage/saturday --bpm 120 --music track.m4a
+```
+
+Needs `ffmpeg`/`ffprobe` on PATH. Nothing else outside the standard library.
+The pipeline half shells out to `run_pipeline_local.py` in a smart-cropping
+checkout — override with `--repo`, `--env`, `--workspace` if yours differ from
+the defaults.
+
+### What it actually does
+
+1. **Probe** every clip: duration, dimensions, capture time, average brightness.
+2. **Filter** on duration and brightness. Rejections are printed with reasons.
+3. **Select** by bucketing the night into equal time windows and taking the
+   longest clip from each, so the edit spans the whole night rather than
+   clustering wherever people filmed most.
+4. **Crop** the survivors through the pipeline, one subprocess per clip. A clip
+   that fails is logged and skipped, never fatal.
+5. **Cut** a fixed-length window from the middle of each clip and concatenate to
+   1080x1920 / 30fps, with optional music over the top.
+
+Every run writes `plan.json`: what was chosen, what was rejected and why, and
+where each artifact landed.
+
+### What is deliberately faked
+
+Named honestly, because they are all cheap to fix later and none of them are
+what this test is asking:
+
+- **Pacing** — a fixed slot, or `4 * 60 / bpm`. No beat detection.
+- **Window** — the middle of the clip. People record before anything happens
+  and stop after it stops; the middle is a guess, not a content decision.
+- **Coverage** — spread over *time*, not over *people*. Per-person coverage
+  needs cross-clip face re-identification, which is real work and would be the
+  first thing to build once framing is proven.
+- **Quality** — duration and brightness only. No shake detection.
+
+### The trap
+
+Do not test this on `white_lotus_2`, `friends_rachel_and_ross`, or
+`big_bang_theory`. They are professionally shot, lit and composed, they are
+sitting right there in the workspace, and they will give you a false positive.
+
+The product lives or dies on amateur footage: mixed orientation, shaky,
+backlit, a thumb over the lens, filmed at 1am. You need 30-50 clips from one
+real event across several different phones. That is the only input that
+answers the question.

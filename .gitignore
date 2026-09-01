@@ -1,0 +1,8 @@
+out/
+footage/
+*.mp4
+*.mov
+*.m4a
+*.mp3
+__pycache__/
+*.pyc
