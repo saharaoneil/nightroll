@@ -55,6 +55,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".heic", ".heif", ".png", ".webp"}
+MEDIA_SUFFIXES = VIDEO_SUFFIXES | IMAGE_SUFFIXES
 
 OUT_W = 1080
 OUT_H = 1920
@@ -75,6 +77,7 @@ class Clip:
     width: int
     height: int
     shot_at: datetime
+    is_still: bool = False
     luma: float | None = None
     # filled in later
     rejected_for: str | None = None
@@ -96,8 +99,129 @@ def _run(cmd: list[str], *, capture: bool = True) -> subprocess.CompletedProcess
     )
 
 
+def probe_media(path: Path) -> Clip | None:
+    """Probe one file, video or still."""
+    if path.suffix.lower() in IMAGE_SUFFIXES:
+        return probe_still(path)
+    return probe_clip(path)
+
+
+def probe_still(path: Path) -> Clip | None:
+    """Read dimensions and capture time out of one photo.
+
+    A still has no duration of its own; it is given the edit's slot length
+    later, so ``duration`` is left at zero here and the duration filter
+    skips stills entirely.
+    """
+    proc = _run(
+        [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "json",
+            str(path),
+        ]
+    )
+    if proc.returncode != 0:
+        return None
+    try:
+        streams = (json.loads(proc.stdout).get("streams") or [])
+    except json.JSONDecodeError:
+        return None
+    if not streams:
+        return None
+
+    width = int(streams[0].get("width") or 0)
+    height = int(streams[0].get("height") or 0)
+
+    if path.suffix.lower() in {".heic", ".heif"}:
+        # An iPhone HEIC is tiled HEVC and ffprobe reports the first tile
+        # (typically 512x512), not the image. Spotlight has the real size.
+        true_size = spotlight_pixel_size(path)
+        if true_size:
+            width, height = true_size
+
+    if not width or not height:
+        return None
+
+    shot_at = exif_datetime(path) or datetime.fromtimestamp(
+        path.stat().st_mtime, tz=timezone.utc
+    )
+    return Clip(
+        path=path, duration=0.0, width=width, height=height,
+        shot_at=shot_at, is_still=True,
+    )
+
+
+def exif_datetime(path: Path) -> datetime | None:
+    """Capture time from Spotlight metadata (macOS).
+
+    ffprobe does not surface EXIF dates for JPEG/HEIC, and mdls does, with
+    no extra dependency. Off macOS this returns None and the caller falls
+    back to mtime.
+    """
+    if not shutil.which("mdls"):
+        return None
+    proc = _run(
+        ["mdls", "-raw", "-name", "kMDItemContentCreationDate", str(path)]
+    )
+    raw = (proc.stdout or "").strip()
+    if not raw or raw == "(null)":
+        return None
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d %H:%M:%S %z")
+    except ValueError:
+        return None
+
+
+def spotlight_pixel_size(path: Path) -> tuple[int, int] | None:
+    """True pixel dimensions from Spotlight metadata (macOS)."""
+    if not shutil.which("mdls"):
+        return None
+
+    # Queried one at a time on purpose: `mdls -raw` with several -name
+    # flags prints the values sorted by attribute NAME, not in the order
+    # the flags were given, so asking for Width then Height returns
+    # height first and silently transposes the image.
+    values: list[int] = []
+    for attribute in ("kMDItemPixelWidth", "kMDItemPixelHeight"):
+        raw = (_run(["mdls", "-raw", "-name", attribute, str(path)]).stdout
+               or "").strip()
+        if not raw.isdigit():
+            return None
+        values.append(int(raw))
+    return values[0], values[1]
+
+
+def ensure_renderable(path: Path, staging: Path) -> Path | None:
+    """Return a path ffmpeg can apply a -vf filtergraph to.
+
+    HEIC needs a decode pass of its own first. ffmpeg stitches its tiles
+    using an internal complex filtergraph, and a simple ``-vf`` on the
+    same stream is rejected outright ("Simple and complex filtering
+    cannot be used together"). Decoding to JPEG first sidesteps that;
+    every other format passes through untouched.
+    """
+    if path.suffix.lower() not in {".heic", ".heif"}:
+        return path
+
+    staging.mkdir(parents=True, exist_ok=True)
+    destination = staging / f"{path.stem}.jpg"
+    if destination.exists():
+        return destination
+
+    proc = _run([
+        "ffmpeg", "-v", "error", "-nostdin", "-y",
+        "-i", str(path), "-frames:v", "1", "-q:v", "2", str(destination),
+    ])
+    if proc.returncode != 0:
+        print(f"      HEIC decode failed: {proc.stderr.strip()[:160]}", flush=True)
+        return None
+    return destination
+
+
 def probe_clip(path: Path) -> Clip | None:
-    """Read duration, dimensions and capture time out of one file."""
+    """Read duration, dimensions and capture time out of one video."""
     proc = _run(
         [
             "ffprobe", "-v", "error",
@@ -198,7 +322,7 @@ def prefilter(
     """Cheap quality gate. Marks rejects in place, returns the survivors."""
     kept: list[Clip] = []
     for clip in clips:
-        if clip.duration < min_duration:
+        if not clip.is_still and clip.duration < min_duration:
             clip.rejected_for = f"too short ({clip.duration:.1f}s < {min_duration}s)"
             continue
         if measure_brightness:
@@ -213,11 +337,15 @@ def prefilter(
 def select_for_edit(clips: list[Clip], *, slots: int) -> list[Clip]:
     """Pick ``slots`` clips spread evenly across the night.
 
-    Buckets the night into ``slots`` equal time windows and takes the
+    Buckets the event into ``slots`` equal time windows and takes the
     longest clip from each. Longest is a crude stand-in for "most
     substantial" -- it is a placeholder, not a claim. Empty buckets are
     backfilled from whatever is left, longest first, so a lull in the
     footage does not shorten the edit.
+
+    Stills have no duration, so within a bucket a video outranks a photo.
+    That is deliberate for now: video is the harder framing case and the
+    one the experiment is really asking about.
     """
     if not clips:
         return []
@@ -310,6 +438,37 @@ def timestamps_look_collapsed(clips: list[Clip]) -> bool:
 # --------------------------------------------------------------------------
 
 
+def still_to_video(
+    clip: Clip, destination: Path, *, seconds: float, long_edge: int = 1920
+) -> bool:
+    """Hold a still as a short video so the real pipeline can consume it.
+
+    The pipeline takes video, so a photo is turned into one rather than
+    reimplementing what the pipeline does to a single frame. It is
+    downscaled to roughly video resolution first: a 4032px phone photo is
+    far larger than any frame the detector expects, and the extra pixels
+    only cost time.
+    """
+    scale = (
+        f"scale='if(gt(iw,ih),{long_edge},-2)':'if(gt(iw,ih),-2,{long_edge})'"
+        f":force_original_aspect_ratio=decrease,"
+        f"pad=ceil(iw/2)*2:ceil(ih/2)*2,fps={OUT_FPS}"
+    )
+    renderable = ensure_renderable(clip.path, destination.parent)
+    if renderable is None:
+        return False
+    proc = _run([
+        "ffmpeg", "-v", "error", "-nostdin", "-y",
+        "-loop", "1", "-t", f"{seconds:.3f}", "-i", str(renderable),
+        "-vf", scale,
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+        "-pix_fmt", "yuv420p", str(destination),
+    ])
+    if proc.returncode != 0:
+        print(f"      still->video failed: {proc.stderr.strip()[:160]}", flush=True)
+    return proc.returncode == 0
+
+
 def run_pipeline(
     clip: Clip,
     *,
@@ -319,12 +478,22 @@ def run_pipeline(
     experiment: str,
     workspace: Path,
     verbose: bool,
+    staging: Path,
+    slot_seconds: float,
 ) -> Path | None:
     """Crop one clip via run_pipeline_local.py, return the cropped mp4."""
+    source = clip.path
+    if clip.is_still:
+        # Keep the original stem so the output glob still finds it.
+        staged = staging / f"{clip.path.stem}.mp4"
+        if not still_to_video(clip, staged, seconds=slot_seconds):
+            return None
+        source = staged
+
     cmd = [
         "conda", "run", "-n", env, "python",
         "scripts/pipeline_runners/run_pipeline_local.py",
-        str(clip.path.resolve()),
+        str(source.resolve()),
         "--genre", genre,
         "--experiment", experiment,
         "--no-annotated",
@@ -345,7 +514,7 @@ def run_pipeline(
         return None
 
     return newest_cropped_output(
-        workspace=workspace, experiment=experiment, stem=clip.path.stem
+        workspace=workspace, experiment=experiment, stem=source.stem
     )
 
 
@@ -374,10 +543,48 @@ NAIVE_VF = (
     f"crop={OUT_W}:{OUT_H},setsar=1,fps={OUT_FPS}"
 )
 
+# Stills are cropped to the output aspect but left at full resolution, so
+# the zoom afterwards has real pixels to push into rather than upscaling.
+NAIVE_STILL_VF = f"crop='min(iw,ih*{OUT_W}/{OUT_H})':'min(ih,iw*{OUT_H}/{OUT_W})'"
+PIPED_STILL_VF = "null"
+
 PIPED_VF = (
     f"scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=decrease,"
     f"pad={OUT_W}:{OUT_H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={OUT_FPS}"
 )
+
+
+def ken_burns(duration: float, *, zoom_to: float = 1.12) -> str:
+    """A slow push across a held still.
+
+    A photo sitting dead still for two and a half seconds inside a
+    music-cut edit reads as a broken video. A gentle zoom reads as
+    intentional. This is the standard fix and it is worth having in the
+    prototype, because otherwise the stills look worse than they are and
+    that would bias the comparison.
+    """
+    frames = still_frames(duration)
+    step = (zoom_to - 1.0) / frames
+    # zoompan's `d` is output frames PER INPUT FRAME, so this filter is only
+    # correct on a single-frame input. Feeding it a looped stream multiplies
+    # the output length by the number of looped frames -- which is exactly
+    # the bug this replaced (63 input frames x 75 = 157s from a 2.5s slot).
+    # render_segment therefore passes the image once and caps with -frames:v.
+    #
+    # Pre-scaled to a little above the output so the zoom has real pixels to
+    # push into, and no higher: a full-resolution phone photo makes zoompan
+    # crawl for no visible gain.
+    return (
+        f"scale={int(OUT_W * 1.4)}:-2,"
+        f"zoompan=z='min(zoom+{step:.6f},{zoom_to})':d={frames}"
+        f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+        f":s={OUT_W}x{OUT_H}:fps={OUT_FPS},setsar=1"
+    )
+
+
+def still_frames(duration: float) -> int:
+    """Output frame count for a held still."""
+    return max(int(duration * OUT_FPS), 1)
 
 
 def render_segment(
@@ -387,14 +594,26 @@ def render_segment(
     start: float,
     duration: float,
     video_filter: str,
+    is_still: bool = False,
 ) -> bool:
-    proc = _run(
-        [
+    if is_still:
+        # One input frame in, `still_frames` out -- see ken_burns().
+        cmd = [
+            "ffmpeg", "-v", "error", "-nostdin", "-y",
+            "-i", str(source),
+            "-vf", f"{video_filter},{ken_burns(duration)}",
+            "-frames:v", str(still_frames(duration)),
+        ]
+    else:
+        cmd = [
             "ffmpeg", "-v", "error", "-nostdin", "-y",
             "-ss", f"{start:.3f}",
             "-i", str(source),
             "-t", f"{duration:.3f}",
             "-vf", video_filter,
+        ]
+    proc = _run(
+        cmd + [
             "-an",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
             "-pix_fmt", "yuv420p",
@@ -455,19 +674,34 @@ def build_edit(
         if source is None:
             continue
         segment = work / f"{clip.slot_index:03d}_{clip.path.stem}.mp4"
-        # A cropped clip can be marginally shorter than its source, so
-        # clamp the window rather than trusting the source duration.
-        start = clip.window_start if label == "naive" else 0.0
-        if label != "naive":
-            cropped_duration = _first_float(
-                _run(["ffprobe", "-v", "error", "-show_entries",
-                      "format=duration", "-of", "csv=p=0", str(source)]).stdout.strip()
-            ) or slot_seconds
-            start = max((cropped_duration - slot_seconds) / 2.0, 0.0)
-        if render_segment(
-            source, segment,
-            start=start, duration=slot_seconds, video_filter=video_filter,
-        ):
+
+        # A still that has been through the pipeline comes back as a video,
+        # so it is rendered like one; only an un-piped still is held.
+        held_still = clip.is_still and label == "naive"
+        if held_still:
+            renderable = ensure_renderable(source, out_dir / "_normalized")
+            if renderable is None:
+                continue
+            ok = render_segment(
+                renderable, segment, start=0.0, duration=slot_seconds,
+                video_filter=NAIVE_STILL_VF, is_still=True,
+            )
+        else:
+            # A cropped clip can be marginally shorter than its source, so
+            # clamp the window rather than trusting the source duration.
+            start = clip.window_start if label == "naive" else 0.0
+            if label != "naive":
+                cropped_duration = _first_float(
+                    _run(["ffprobe", "-v", "error", "-show_entries",
+                          "format=duration", "-of", "csv=p=0",
+                          str(source)]).stdout.strip()
+                ) or slot_seconds
+                start = max((cropped_duration - slot_seconds) / 2.0, 0.0)
+            ok = render_segment(
+                source, segment, start=start, duration=slot_seconds,
+                video_filter=video_filter,
+            )
+        if ok:
             segments.append(segment)
 
     if not segments:
@@ -550,14 +784,17 @@ def main() -> int:
     # ---- probe -----------------------------------------------------------
     sources = sorted(
         p for p in args.footage.iterdir()
-        if p.is_file() and p.suffix.lower() in VIDEO_SUFFIXES
+        if p.is_file() and p.suffix.lower() in MEDIA_SUFFIXES
     )
     if not sources:
-        print(f"error: no video files in {args.footage}", file=sys.stderr)
+        print(f"error: no photos or videos in {args.footage}", file=sys.stderr)
         return 2
 
-    print(f"probing {len(sources)} clips ...", flush=True)
-    clips = [c for c in (probe_clip(p) for p in sources) if c is not None]
+    stills_found = sum(1 for p in sources if p.suffix.lower() in IMAGE_SUFFIXES)
+    print(f"probing {len(sources)} files "
+          f"({len(sources) - stills_found} video, {stills_found} photo) ...",
+          flush=True)
+    clips = [c for c in (probe_media(p) for p in sources) if c is not None]
     unreadable = len(sources) - len(clips)
     if unreadable:
         print(f"  {unreadable} unreadable, skipped")
@@ -630,13 +867,16 @@ def main() -> int:
     set_windows(selected, slot_seconds=slot_seconds)
 
     print()
-    print(f"plan: {len(selected)} clips x {slot_seconds:.2f}s "
+    n_stills = sum(1 for c in selected if c.is_still)
+    print(f"plan: {len(selected)} items ({len(selected) - n_stills} video, "
+          f"{n_stills} photo) x {slot_seconds:.2f}s "
           f"= {len(selected) * slot_seconds:.1f}s "
           f"(from {len(kept)} usable of {len(sources)} found)")
     for clip in selected:
         orientation = "portrait" if clip.is_portrait else "landscape"
+        kind = "photo" if clip.is_still else f"{clip.duration:.1f}s"
         print(f"  {clip.slot_index:>3}  {clip.shot_at.astimezone():%H:%M:%S}  "
-              f"{clip.duration:>5.1f}s  {orientation:>9}  {clip.path.name}")
+              f"{kind:>6}  {orientation:>9}  {clip.path.name}")
 
     args.out.mkdir(parents=True, exist_ok=True)
     manifest = {
@@ -654,6 +894,7 @@ def main() -> int:
                 "slot": c.slot_index,
                 "file": c.path.name,
                 "shot_at": c.shot_at.isoformat(),
+                "kind": "photo" if c.is_still else "video",
                 "duration": round(c.duration, 3),
                 "window_start": round(c.window_start, 3),
                 "orientation": "portrait" if c.is_portrait else "landscape",
@@ -696,6 +937,9 @@ def main() -> int:
         print(f"\ncropping {len(selected)} clips through the pipeline "
               f"(experiment {experiment}) ...", flush=True)
 
+        staging = args.out / "_staged_stills"
+        staging.mkdir(parents=True, exist_ok=True)
+
         cropped: dict[Path, Path] = {}
         for clip in selected:
             print(f"  [{clip.slot_index + 1}/{len(selected)}] {clip.path.name}",
@@ -704,7 +948,8 @@ def main() -> int:
                 clip,
                 repo=args.repo, env=args.env, genre=args.genre,
                 experiment=experiment, workspace=args.workspace,
-                verbose=args.verbose,
+                verbose=args.verbose, staging=staging,
+                slot_seconds=slot_seconds,
             )
             if result:
                 cropped[clip.path] = result

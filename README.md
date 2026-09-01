@@ -292,6 +292,32 @@ the defaults.
 Every run writes `plan.json`: what was chosen, what was rejected and why, and
 where each artifact landed.
 
+### Photos as well as video
+
+A night out is mostly photos, so the tool takes both. Stills are held for the
+slot length with a slow push (a photo sitting dead still inside a music-cut
+edit reads as a broken video; a gentle zoom reads as intentional), and they
+interleave with video clips in capture order.
+
+Photos test the framing question too, just a different half of it: a group
+photo centre-cropped to 9:16 chops people out of frame, and that is a very
+visible failure for subject-aware cropping to beat. Video is the harder case
+because the crop has to track motion, so within a time bucket a video outranks
+a photo.
+
+`.jpg`, `.jpeg`, `.png`, `.webp`, `.heic` and `.heif` are accepted.
+
+#### HEIC needs two passes, and lies about its size
+
+Worth knowing because both failures are silent rather than loud:
+
+- An iPhone HEIC is **tiled HEVC**, and ffmpeg stitches the tiles with an
+  internal complex filtergraph. Adding a simple `-vf` on top is rejected
+  outright, so HEICs are decoded to JPEG first and filtered after.
+- `ffprobe` reports the size of the **first tile** (typically 512x512), not
+  the image. Spotlight has the real dimensions, so HEIC sizes come from
+  `mdls` instead.
+
 ### Footage from more than one night
 
 Fine — that is the normal case, and the tool expects it.
